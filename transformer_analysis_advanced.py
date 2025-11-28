@@ -155,6 +155,29 @@ class TransformerSimulator:
         return t, y
 
 
+def calculate_voltage_regulation(power_kva: float, line_voltage_kv: float,
+                                 resistance_ohm: float, reactance_ohm: float,
+                                 power_factor: float, leading: bool = False) -> Tuple[float, complex, complex]:
+    """Calculate voltage regulation for a three-phase alternator.
+
+    Returns percentage regulation, generated emf (phase), and terminal voltage (phase).
+    """
+    vt_phase = (line_voltage_kv * 1000) / np.sqrt(3)
+    ia = (power_kva * 1000) / (np.sqrt(3) * line_voltage_kv * 1000)
+
+    angle = np.arccos(power_factor)
+    if leading:
+        angle = -angle
+
+    ia_complex = ia * np.cos(angle) + 1j * ia * np.sin(angle)
+    impedance = resistance_ohm + 1j * reactance_ohm
+
+    e_phase = vt_phase + ia_complex * impedance
+    regulation = (np.abs(e_phase) - vt_phase) / vt_phase * 100
+
+    return regulation, e_phase, vt_phase
+
+
 class TransformerGUI:
     """Main GUI Application"""
 
@@ -221,6 +244,8 @@ class TransformerGUI:
         self.create_dynamic_simulation_tab()
         self.create_load_analysis_tab()
         self.create_thermal_analysis_tab()
+        self.create_alternator_tab()
+        self.create_comprehensive_tab()
 
     def create_efficiency_tab(self):
         """Tab for all-day efficiency calculation"""
@@ -404,6 +429,134 @@ class TransformerGUI:
 
         # Initial plot
         self.update_load_analysis()
+
+    def create_alternator_tab(self):
+        """Tab for alternator voltage regulation and phasor diagrams"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Alternator Lab")
+
+        container = ttk.Frame(tab)
+        container.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # Input parameters
+        input_frame = ttk.LabelFrame(container, text="Machine Parameters", padding=10)
+        input_frame.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+
+        defaults = {
+            'power_kva': 500.0,
+            'voltage_kv': 1.1,
+            'frequency': 50.0,
+            'resistance': 0.2,
+            'reactance': 1.5
+        }
+
+        self.alt_vars = {}
+        labels = [
+            ("Rated Power (kVA)", 'power_kva'),
+            ("Line Voltage (kV)", 'voltage_kv'),
+            ("Frequency (Hz)", 'frequency'),
+            ("Armature Resistance (Ω/phase)", 'resistance'),
+            ("Synchronous Reactance (Ω/phase)", 'reactance'),
+        ]
+
+        for i, (label, key) in enumerate(labels):
+            ttk.Label(input_frame, text=label).grid(row=i, column=0, sticky='w', pady=3)
+            var = tk.DoubleVar(value=defaults[key])
+            entry = ttk.Entry(input_frame, textvariable=var, width=12)
+            entry.grid(row=i, column=1, padx=5, pady=3)
+            self.alt_vars[key] = var
+
+        # Power factor controls
+        ttk.Label(input_frame, text="Power Factor").grid(row=len(labels), column=0, sticky='w', pady=3)
+        self.alt_pf_var = tk.DoubleVar(value=0.8)
+        pf_slider = ttk.Scale(input_frame, from_=0.1, to=1.0, variable=self.alt_pf_var,
+                              orient='horizontal', length=180,
+                              command=lambda v: self.alt_pf_label.config(text=f"{float(v):.3f}"))
+        pf_slider.grid(row=len(labels), column=1, padx=5, pady=3, sticky='ew')
+        self.alt_pf_label = ttk.Label(input_frame, text="0.800")
+        self.alt_pf_label.grid(row=len(labels), column=2, padx=5)
+
+        ttk.Label(input_frame, text="Power Factor Mode").grid(row=len(labels)+1, column=0, sticky='w', pady=3)
+        self.alt_pf_mode = tk.StringVar(value='lagging')
+        pf_combo = ttk.Combobox(input_frame, textvariable=self.alt_pf_mode, values=['lagging', 'leading'],
+                                state='readonly', width=10)
+        pf_combo.grid(row=len(labels)+1, column=1, padx=5, pady=3, sticky='w')
+
+        ttk.Label(input_frame, text="Load Level (%)").grid(row=len(labels)+2, column=0, sticky='w', pady=3)
+        self.alt_load_var = tk.DoubleVar(value=100.0)
+        load_slider = ttk.Scale(input_frame, from_=20, to=120, variable=self.alt_load_var,
+                                orient='horizontal', length=180,
+                                command=lambda v: self.alt_load_label.config(text=f"{float(v):.1f}%"))
+        load_slider.grid(row=len(labels)+2, column=1, padx=5, pady=3, sticky='ew')
+        self.alt_load_label = ttk.Label(input_frame, text="100.0%")
+        self.alt_load_label.grid(row=len(labels)+2, column=2, padx=5)
+
+        btn_frame = ttk.Frame(input_frame)
+        btn_frame.grid(row=len(labels)+3, column=0, columnspan=3, pady=10)
+
+        ttk.Button(btn_frame, text="Compute Regulation", command=self.compute_alternator_regulation,
+                   width=20).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Solve 0.8 pf Cases", command=self.solve_reference_cases,
+                   width=20).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Reset", command=self.reset_alternator_inputs,
+                   width=12).pack(side='left', padx=5)
+
+        # Results and visualization
+        result_frame = ttk.LabelFrame(container, text="Results & Phasor Diagram", padding=10)
+        result_frame.grid(row=0, column=1, sticky='nsew', padx=5, pady=5)
+
+        self.alt_results = scrolledtext.ScrolledText(result_frame, width=60, height=18, font=('Courier', 10))
+        self.alt_results.pack(fill='x', expand=False, pady=5)
+
+        self.alt_figure = Figure(figsize=(8, 6), dpi=100)
+        self.alt_canvas = FigureCanvasTkAgg(self.alt_figure, result_frame)
+        self.alt_canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        container.columnconfigure(0, weight=1)
+        container.columnconfigure(1, weight=2)
+        container.rowconfigure(0, weight=1)
+
+    def create_comprehensive_tab(self):
+        """Advanced dashboard combining machine insights"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Comprehensive Analysis")
+
+        control = ttk.LabelFrame(tab, text="Scenario Controls", padding=10)
+        control.pack(fill='x', padx=10, pady=5)
+
+        self.comp_load_var = tk.DoubleVar(value=80)
+        self.comp_pf_var = tk.DoubleVar(value=0.95)
+        self.comp_solver = tk.StringVar(value='rk45')
+
+        ttk.Label(control, text="Load Swing (%)").grid(row=0, column=0, padx=5)
+        ttk.Scale(control, from_=10, to=120, variable=self.comp_load_var, orient='horizontal', length=200,
+                  command=lambda v: self.comp_load_label.config(text=f"{float(v):.1f}%"))\
+            .grid(row=0, column=1, padx=5, sticky='ew')
+        self.comp_load_label = ttk.Label(control, text="80.0%")
+        self.comp_load_label.grid(row=0, column=2, padx=5)
+
+        ttk.Label(control, text="Target Power Factor").grid(row=0, column=3, padx=5)
+        ttk.Scale(control, from_=0.6, to=1.0, variable=self.comp_pf_var, orient='horizontal', length=200,
+                  command=lambda v: self.comp_pf_label.config(text=f"{float(v):.3f}"))\
+            .grid(row=0, column=4, padx=5, sticky='ew')
+        self.comp_pf_label = ttk.Label(control, text="0.950")
+        self.comp_pf_label.grid(row=0, column=5, padx=5)
+
+        ttk.Label(control, text="ODE Solver").grid(row=0, column=6, padx=5)
+        ttk.Combobox(control, textvariable=self.comp_solver, values=['rk45', 'euler'], state='readonly', width=10)\
+            .grid(row=0, column=7, padx=5)
+
+        ttk.Button(control, text="Run Comprehensive Study", command=self.update_comprehensive_dashboard,
+                   width=28).grid(row=0, column=8, padx=10)
+
+        viz = ttk.LabelFrame(tab, text="Dashboard", padding=10)
+        viz.pack(fill='both', expand=True, padx=10, pady=5)
+
+        self.comp_figure = Figure(figsize=(14, 8), dpi=100)
+        self.comp_canvas = FigureCanvasTkAgg(self.comp_figure, viz)
+        self.comp_canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        self.update_comprehensive_dashboard()
 
     def create_thermal_analysis_tab(self):
         """Tab for thermal analysis"""
@@ -792,6 +945,215 @@ class TransformerGUI:
 
         self.load_canvas.draw()
 
+    def compute_alternator_regulation(self):
+        """Compute voltage regulation and plot phasor diagram"""
+        try:
+            power_kva = self.alt_vars['power_kva'].get() * (self.alt_load_var.get() / 100)
+            voltage_kv = self.alt_vars['voltage_kv'].get()
+            resistance = self.alt_vars['resistance'].get()
+            reactance = self.alt_vars['reactance'].get()
+            pf = max(0.1, min(1.0, self.alt_pf_var.get()))
+            leading = self.alt_pf_mode.get() == 'leading'
+
+            reg, e_phase, vt_phase = calculate_voltage_regulation(power_kva, voltage_kv,
+                                                                  resistance, reactance,
+                                                                  pf, leading)
+
+            ia = (power_kva * 1000) / (np.sqrt(3) * voltage_kv * 1000)
+            angle = np.arccos(pf)
+            if leading:
+                angle = -angle
+            ia_complex = ia * np.cos(angle) + 1j * ia * np.sin(angle)
+
+            self.alt_results.delete(1.0, tk.END)
+            self.alt_results.insert(tk.END, "ALTERNATOR VOLTAGE REGULATION\n")
+            self.alt_results.insert(tk.END, "="*60 + "\n")
+            self.alt_results.insert(tk.END, f"Load: {power_kva:.2f} kVA ({self.alt_load_var.get():.1f}%)\n")
+            self.alt_results.insert(tk.END, f"Line Voltage: {voltage_kv:.3f} kV\n")
+            self.alt_results.insert(tk.END, f"Armature Resistance: {resistance:.3f} Ω\n")
+            self.alt_results.insert(tk.END, f"Synchronous Reactance: {reactance:.3f} Ω\n")
+            self.alt_results.insert(tk.END, f"Power Factor: {pf:.3f} ({'leading' if leading else 'lagging'})\n")
+            self.alt_results.insert(tk.END, f"Per-phase Terminal Voltage: {vt_phase:.2f} V\n")
+            self.alt_results.insert(tk.END, f"Line Current: {ia:.2f} A\n")
+            self.alt_results.insert(tk.END, f"Internal Generated EMF: {np.abs(e_phase):.2f} V (phase)\n")
+            self.alt_results.insert(tk.END, f"Voltage Regulation: {reg:.3f}%\n")
+
+            self.plot_phasor_diagram(vt_phase, ia_complex, resistance, reactance, e_phase)
+        except Exception as e:
+            messagebox.showerror("Alternator Calculation Error", str(e))
+
+    def plot_phasor_diagram(self, vt_phase: float, ia: complex, r: float, x: float, emf: complex):
+        """Plot phasor diagram for alternator"""
+        self.alt_figure.clear()
+        ax = self.alt_figure.add_subplot(1, 1, 1)
+
+        vt_vec = vt_phase + 0j
+        ia_vec = ia
+        ir_drop = ia * r
+        ix_drop = ia * 1j * x
+
+        def draw_vector(start: complex, vec: complex, color: str, label: str):
+            ax.arrow(start.real, start.imag, vec.real, vec.imag, head_width=0.05*vt_phase,
+                     head_length=0.05*vt_phase, fc=color, ec=color, length_includes_head=True)
+            ax.text(start.real + vec.real, start.imag + vec.imag, label, color=color, fontsize=9)
+
+        draw_vector(0+0j, vt_vec, 'blue', 'Vt')
+        draw_vector(0+0j, ia_vec*vt_phase/abs(vt_phase), 'green', 'Ia (scaled)')
+        draw_vector(vt_vec, ir_drop, 'orange', 'IaR')
+        draw_vector(vt_vec + ir_drop, ix_drop, 'red', 'IaX')
+        draw_vector(0+0j, emf, 'purple', 'E')
+
+        max_mag = max(np.abs([vt_vec, ia_vec*vt_phase/abs(vt_phase), ir_drop, ix_drop, emf])) * 1.3
+        ax.set_xlim(-max_mag, max_mag)
+        ax.set_ylim(-max_mag, max_mag)
+        ax.set_aspect('equal', adjustable='datalim')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel('Real Axis (V)')
+        ax.set_ylabel('Imag Axis (V)')
+        ax.set_title('Alternator Phasor Diagram')
+        self.alt_figure.tight_layout()
+        self.alt_canvas.draw()
+
+    def solve_reference_cases(self):
+        """Solve 0.8 lag/lead regulation for reference problem"""
+        try:
+            # Set defaults
+            self.alt_vars['power_kva'].set(500.0)
+            self.alt_vars['voltage_kv'].set(1.1)
+            self.alt_vars['resistance'].set(0.2)
+            self.alt_vars['reactance'].set(1.5)
+            self.alt_pf_var.set(0.8)
+            self.alt_load_var.set(100.0)
+            self.alt_pf_label.config(text="0.800")
+            self.alt_load_label.config(text="100.0%")
+
+            lag_reg, lag_e, vt = calculate_voltage_regulation(500.0, 1.1, 0.2, 1.5, 0.8, leading=False)
+            lead_reg, lead_e, _ = calculate_voltage_regulation(500.0, 1.1, 0.2, 1.5, 0.8, leading=True)
+
+            self.alt_results.delete(1.0, tk.END)
+            self.alt_results.insert(tk.END, "REFERENCE CASE (500 kVA, 1.1 kV, 50 Hz)\n")
+            self.alt_results.insert(tk.END, "="*60 + "\n")
+            self.alt_results.insert(tk.END, f"Voltage Regulation @ 0.8 lagging: {lag_reg:.3f}%\n")
+            self.alt_results.insert(tk.END, f"Voltage Regulation @ 0.8 leading: {lead_reg:.3f}%\n")
+            self.alt_results.insert(tk.END, "Computed using E = V + I(R + jX) per phase." )
+
+            # Plot lagging by default
+            ia = (500000) / (np.sqrt(3) * 1100)
+            angle = np.arccos(0.8)
+            ia_vec = ia * np.cos(angle) - 1j * ia * np.sin(angle)
+            self.plot_phasor_diagram(vt, ia_vec, 0.2, 1.5, lag_e)
+        except Exception as e:
+            messagebox.showerror("Reference Case Error", str(e))
+
+    def reset_alternator_inputs(self):
+        """Reset alternator inputs to defaults"""
+        defaults = {
+            'power_kva': 500.0,
+            'voltage_kv': 1.1,
+            'frequency': 50.0,
+            'resistance': 0.2,
+            'reactance': 1.5
+        }
+        for key, value in defaults.items():
+            self.alt_vars[key].set(value)
+        self.alt_pf_var.set(0.8)
+        self.alt_pf_label.config(text="0.800")
+        self.alt_pf_mode.set('lagging')
+        self.alt_load_var.set(100.0)
+        self.alt_load_label.config(text="100.0%")
+        self.alt_results.delete(1.0, tk.END)
+        self.alt_figure.clear()
+        self.alt_canvas.draw()
+
+    def update_comprehensive_dashboard(self):
+        """Create an at-a-glance dashboard for system performance"""
+        load = self.comp_load_var.get() / 100
+        pf = self.comp_pf_var.get()
+        solver = self.comp_solver.get()
+
+        # Quick dynamic run for temperature and current trends
+        t, y = self.simulator.simulate_dynamic(method=solver, duration=5, dt=0.02)
+        flux, i_prim, i_sec, temp = y.T
+
+        real_power = self.params.rated_power * load * pf
+        reactive_power = self.params.rated_power * load * np.sqrt(max(0, 1 - pf**2))
+        copper_loss = self.params.copper_loss_full * load**2
+        iron_loss = self.params.iron_loss
+
+        self.comp_figure.clear()
+        gs = self.comp_figure.add_gridspec(2, 3, hspace=0.35, wspace=0.35)
+
+        ax1 = self.comp_figure.add_subplot(gs[0, 0])
+        ax1.plot(t, i_prim, label='Primary', color='tab:red')
+        ax1.plot(t, i_sec, label='Secondary', color='tab:blue')
+        ax1.set_title('Dynamic Currents')
+        ax1.set_xlabel('Time (s)')
+        ax1.set_ylabel('Current (A)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        ax2 = self.comp_figure.add_subplot(gs[0, 1])
+        ax2.plot(t, flux, color='tab:green')
+        ax2.set_title('Flux Linkage Response')
+        ax2.set_xlabel('Time (s)')
+        ax2.set_ylabel('Flux (Wb)')
+        ax2.grid(True, alpha=0.3)
+
+        ax3 = self.comp_figure.add_subplot(gs[0, 2])
+        efficiency = real_power / (real_power + copper_loss + iron_loss) * 100 if real_power > 0 else 0
+        ax3.bar(['Real Power', 'Reactive Power', 'Efficiency'], [real_power, reactive_power, efficiency],
+                color=['#4CAF50', '#2196F3', '#FFC107'])
+        ax3.set_title('Power Snapshot')
+        ax3.set_ylim(0, max(100, real_power + 20))
+
+        ax4 = self.comp_figure.add_subplot(gs[1, 0])
+        ax4.plot(t, temp, color='orange')
+        ax4.set_title('Core Temperature (5s preview)')
+        ax4.set_xlabel('Time (s)')
+        ax4.set_ylabel('Temperature (°C)')
+        ax4.grid(True, alpha=0.3)
+
+        ax5 = self.comp_figure.add_subplot(gs[1, 1])
+        pf_range = np.linspace(0.6, 1.0, 25)
+        reg_curve = []
+        for pf_val in pf_range:
+            reg, _, _ = calculate_voltage_regulation(self.params.rated_power, self.params.voltage_primary,
+                                                     self.params.resistance_primary, self.params.reactance_primary,
+                                                     pf_val, leading=False)
+            reg_curve.append(reg)
+        ax5.plot(pf_range, reg_curve, 'm-')
+        ax5.axvline(pf, color='k', linestyle='--', label='Current PF')
+        ax5.set_title('Voltage Regulation vs PF (lagging)')
+        ax5.set_xlabel('Power Factor')
+        ax5.set_ylabel('Regulation (%)')
+        ax5.legend()
+        ax5.grid(True, alpha=0.3)
+
+        ax6 = self.comp_figure.add_subplot(gs[1, 2])
+        summary = [
+            ['Metric', 'Value'],
+            ['Load', f'{self.comp_load_var.get():.1f}%'],
+            ['PF Target', f'{pf:.3f}'],
+            ['ODE Solver', solver.upper()],
+            ['Real Power', f'{real_power:.2f} kW'],
+            ['Reactive Power', f'{reactive_power:.2f} kVAR'],
+            ['Copper Loss', f'{copper_loss:.2f} kW'],
+            ['Iron Loss', f'{iron_loss:.2f} kW'],
+            ['Instant Eff.', f'{efficiency:.2f}%']
+        ]
+        table = ax6.table(cellText=summary, colWidths=[0.55, 0.45], loc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 1.8)
+        for i in range(2):
+            table[(0, i)].set_facecolor('#4CAF50')
+            table[(0, i)].set_text_props(color='white', weight='bold')
+        ax6.axis('off')
+        ax6.set_title('Scenario Summary', pad=10)
+
+        self.comp_figure.tight_layout()
+        self.comp_canvas.draw()
+
     def simulate_thermal(self):
         """Simulate thermal behavior"""
         try:
@@ -874,6 +1236,8 @@ class TransformerGUI:
                 self.sim_canvas.draw()
                 self.load_canvas.draw()
                 self.thermal_canvas.draw()
+                self.alt_canvas.draw()
+                self.comp_canvas.draw()
             except:
                 pass
 
